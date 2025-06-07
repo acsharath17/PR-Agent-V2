@@ -1,17 +1,21 @@
 import os
+import uuid
 import requests
 import openai
 import re
-from typing import TypedDict, List
+from typing import TypedDict, List, Dict
 from langgraph.graph import StateGraph, END
 from fastapi import FastAPI
 from pydantic import BaseModel
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from threading import Thread
 
-openai.api_key = os.getenv("OPENAI_API_KEY")  # Load API key from environment
+openai.api_key = os.getenv("OPENAI_API_KEY")
 
-# --- Define the shared state schema ---
+# In-memory job store
+job_store: Dict[str, Dict] = {}
+
 class FileResult(TypedDict):
     filename: str
     diff: str
@@ -27,7 +31,7 @@ class PRState(TypedDict):
     dev_summary: str
     business_summary: str
 
-# FastAPI app setup
+# FastAPI setup
 app = FastAPI()
 app.add_middleware(
     CORSMiddleware,
@@ -37,14 +41,12 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# --- Helper: Detect Apex file ---
+# LangGraph setup
 def is_apex_file(filename: str) -> bool:
     return filename.endswith(".cls") or filename.endswith(".trigger")
 
-# --- LangGraph Nodes ---
 def fetch_pr_diff(state: PRState) -> PRState:
-    pr_url = state["pr_url"]
-    diff_url = pr_url + ".diff"
+    diff_url = state["pr_url"] + ".diff"
     diff = requests.get(diff_url).text
     return {**state, "diff": diff}
 
@@ -66,25 +68,27 @@ def split_by_file(state: PRState) -> PRState:
 def process_files(state: PRState) -> PRState:
     updated_files = []
     for file in state["files"]:
-        filename = file["filename"]
         diff = file["diff"]
         explanation = openai.chat.completions.create(
             model="gpt-4",
-            messages=[{"role": "user", "content": f"Explain in detail the changes made in this file and why they might have been made.\n\n{diff}"}],
+            messages=[{"role": "user", "content": f"Explain the changes in this file:\n\n{diff}"}],
             max_tokens=500
         ).choices[0].message.content.strip()
+
         review_comments = ""
         if file["is_apex"]:
             review_comments = openai.chat.completions.create(
                 model="gpt-4",
-                messages=[{"role": "user", "content": f"Review the following Apex code diff for adherence to Salesforce best practices.\n\n{diff}"}],
+                messages=[{"role": "user", "content": f"Review the following Apex code for best practices:\n\n{diff}"}],
                 max_tokens=500
             ).choices[0].message.content.strip()
+
         business_summary = openai.chat.completions.create(
             model="gpt-4",
-            messages=[{"role": "user", "content": f"Explain what was changed in this file in plain language for business stakeholders. Avoid technical jargon.\n\n{diff}"}],
+            messages=[{"role": "user", "content": f"Summarize this file change for business users:\n\n{diff}"}],
             max_tokens=300
         ).choices[0].message.content.strip()
+
         updated_files.append({
             **file,
             "explanation": explanation,
@@ -96,25 +100,26 @@ def process_files(state: PRState) -> PRState:
 def aggregate_summaries(state: PRState) -> PRState:
     explanations = [f"Changes in {f['filename']}:\n{f['explanation']}" for f in state["files"]]
     business_summaries = [f["business_summary"] for f in state["files"]]
-    dev_summary_prompt = "\n\n".join(explanations)
-    business_prompt = "\n\n".join(business_summaries)
+
     dev_summary = openai.chat.completions.create(
         model="gpt-4",
-        messages=[{"role": "user", "content": f"Summarize this PR for developers:\n\n{dev_summary_prompt}"}],
+        messages=[{"role": "user", "content": "\n\n".join(explanations)}],
         max_tokens=400
     ).choices[0].message.content.strip()
+
     business_summary = openai.chat.completions.create(
         model="gpt-4",
-        messages=[{"role": "user", "content": f"Summarize this PR for business stakeholders in non-technical language:\n\n{business_prompt}"}],
+        messages=[{"role": "user", "content": "\n\n".join(business_summaries)}],
         max_tokens=300
     ).choices[0].message.content.strip()
+
     return {
         **state,
         "dev_summary": dev_summary,
         "business_summary": business_summary,
     }
 
-# --- LangGraph Setup ---
+# LangGraph configuration
 builder = StateGraph(PRState)
 builder.add_node("fetch_diff", fetch_pr_diff)
 builder.add_node("split_by_file", split_by_file)
@@ -127,14 +132,32 @@ builder.add_edge("process_files", "aggregate_summaries")
 builder.add_edge("aggregate_summaries", END)
 graph = builder.compile()
 
-# --- FastAPI Routes ---
+# API models
 class PRRequest(BaseModel):
     pr_url: str
 
+# Async Job API
 @app.post("/analyze_pr")
-async def analyze_pr(request: PRRequest):
-    result = graph.invoke({"pr_url": request.pr_url})
-    return JSONResponse(content=result)
+async def analyze_pr(req: PRRequest):
+    job_id = str(uuid.uuid4())
+    job_store[job_id] = {"status": "processing", "result": None}
+
+    def run_job():
+        try:
+            result = graph.invoke({"pr_url": req.pr_url})
+            job_store[job_id] = {"status": "done", "result": result}
+        except Exception as e:
+            job_store[job_id] = {"status": "error", "error": str(e)}
+
+    Thread(target=run_job).start()
+    return {"job_id": job_id, "status": "submitted"}
+
+@app.get("/status/{job_id}")
+async def check_status(job_id: str):
+    job = job_store.get(job_id)
+    if not job:
+        return {"error": "Invalid job ID"}
+    return job
 
 @app.post("/approve_pr")
 async def approve_pr(pr: PRRequest):
@@ -143,7 +166,7 @@ async def approve_pr(pr: PRRequest):
         "Authorization": f"token {token}",
         "Accept": "application/vnd.github+json"
     }
-    match = re.search(r"github.com/(.*?)/(.*?)/pull/(\d+)", pr.pr_url)
+    match = re.search(r"github.com/(.*?)/(.*?)/pull/(\\d+)", pr.pr_url)
     if not match:
         return {"error": "Invalid GitHub PR URL"}
     owner, repo, pr_number = match.groups()
